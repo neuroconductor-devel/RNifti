@@ -49,7 +49,7 @@ BEGIN_RCPP
     const double maxValue = as<double>(_maxValue);
     
     if (pixels * channels != length)
-        Rf_error("Data length (%d) is not a multiple of the number of channels (%d)", (int) length, channels);
+        stop("Data length (%d) is not a multiple of the number of channels (%d)", (int) length, channels);
     
     NumericVector source(_object);
     IntegerVector result(pixels);
@@ -128,21 +128,26 @@ BEGIN_RCPP
     const std::string datatype = as<std::string>(_datatype);
     const bool willChangeDatatype = (datatype != "auto");
     const int internal = as<int>(_internal);
-    const bool usePointer = (internal == 1 || (internal == NA_LOGICAL && Rf_inherits(_image,"internalImage")) || willChangeDatatype);
+    bool usePointer = (internal == 1 || (internal == NA_LOGICAL && Rf_inherits(_image,"internalImage")) || willChangeDatatype);
     
     NiftiImage image;
-    if (Rf_isVectorList(_reference) && Rf_length(_reference) < 36)
+    if (Rf_isNull(_reference))
+        image = NiftiImage(_image);
+    else if (Rf_isVectorList(_reference) && !Rf_inherits(_reference,"niftiHeader"))
     {
+        // An incomplete list of fields to overlay onto the image, rather than a full reference
         image = NiftiImage(_image);
         image.update(_reference);
     }
-    else if (Rf_isNull(_reference))
-        image = NiftiImage(_image);
     else
     {
         image = NiftiImage(_reference);
         image.update(_image);
     }
+    
+    // There's little point materialising an array from a data-free image object, and it will produce a warning
+    if (image.data().isEmpty())
+        usePointer = true;
     
     if (willChangeDatatype)
         image.changeDatatype(datatype);
@@ -194,6 +199,8 @@ BEGIN_RCPP
     
     int nbyper;
     nifti_datatype_sizes(datatype, &nbyper, NULL);
+    if (nbyper <= 0)
+        stop("Data type %d is not supported", datatype);
     
     // NA means the caller wants us to guess if the file is gzipped
     // NB: as<bool> gives true for NA_LOGICAL, so we need to convert to int to test for this value
@@ -209,7 +216,7 @@ BEGIN_RCPP
             uint16_t magic;
             std::ifstream stream(filename.c_str(), std::ios::binary);
             if (stream.fail())
-                Rf_error("Failed to open file %s", filename.c_str());
+                stop("Failed to open file %s", filename.c_str());
             stream.read(reinterpret_cast<char*>(&magic), 2);
             gzipped = (magic == (swap ? 0x8b1f : 0x1f8b));
             stream.close();
@@ -218,12 +225,19 @@ BEGIN_RCPP
     
     znzFile file = znzopen(filename.c_str(), "rb", gzipped);
     if (znz_isnull(file))
-        Rf_error("Failed to open file %s", filename.c_str());
+        stop("Failed to open file %s", filename.c_str());
     if (offset > 0)
         znzseek(file, offset, SEEK_SET);
     char *buffer = (char *) calloc(length, nbyper);
-    znzread(buffer, nbyper, length, file);
+    if (buffer == NULL)
+    {
+        znzclose(file);
+        stop("Failed to allocate memory for a data blob of %lu elements", (unsigned long) length);
+    }
+    const size_t obtained = znzread(buffer, nbyper, length, file);
     znzclose(file);
+    if (obtained < length)
+        Rf_warning("Read only %lu of %lu expected elements from file %s", (unsigned long) obtained, (unsigned long) length, filename.c_str());
     
     if (swap)
         nifti_swap_Nbytes(length, nbyper, buffer);
@@ -397,7 +411,7 @@ BEGIN_RCPP
         else if (version == 2)
             header.n2 = *((nifti_2_header *) ptr);
         else
-            Rf_error("File is not in NIfTI-1 or NIfTI-2 format");
+            stop("File is not in NIfTI-1 or NIfTI-2 format");
         free(ptr);
     }
     else
@@ -448,7 +462,7 @@ BEGIN_RCPP
         if (ptr == NULL)
             return R_NilValue;
         else if (version < 0 || version > 1)
-            Rf_error("File is not in ANALYZE-7.5 or NIfTI-1 format");
+            stop("File is not in ANALYZE-7.5 or NIfTI-1 format");
         header = *((nifti_1_header *) ptr);
         free(ptr);
     }
@@ -557,8 +571,8 @@ BEGIN_RCPP
         if (MAYBE_SHARED(_image))
             image = Rf_duplicate(image);
         
-        double qbcd[3], qxyz[3], dxyz[3], qfac;
-        nifti_dmat44_to_quatern(xform, &qbcd[0], &qbcd[1], &qbcd[2], &qxyz[0], &qxyz[1], &qxyz[2], &dxyz[0], &dxyz[1], &dxyz[2], &qfac);
+        double qbcd[3], qxyz[3], qfac;
+        nifti_dmat44_to_quatern(xform, &qbcd[0], &qbcd[1], &qbcd[2], &qxyz[0], &qxyz[1], &qxyz[2], NULL, NULL, NULL, &qfac);
         
         if (as<bool>(_isQform))
         {
@@ -583,10 +597,6 @@ BEGIN_RCPP
             if (code >= 0)
                 *INTEGER(image["sform_code"]) = code;
         }
-        
-        const int dimensionality = INTEGER(image["dim"])[0];
-        for (int i=0; i<std::min(3,dimensionality); i++)
-            REAL(image["pixdim"])[i+1] = dxyz[i];
         
         return image;
     }
@@ -721,7 +731,7 @@ RcppExport SEXP indexVector (SEXP _image, SEXP _indices)
 BEGIN_RCPP
     const NiftiImage image(_image, true, true);
     if (image.isNull())
-        Rf_error("Cannot index into a NULL image");
+        stop("Cannot index into a NULL image");
     else if (image->data == NULL)
         return LogicalVector(Rf_length(_indices), NA_LOGICAL);
     else
@@ -733,21 +743,21 @@ BEGIN_RCPP
             ComplexVector result(indices.length());
             const Rcomplex naValue = complexNA();
             for (int i=0; i<indices.length(); i++)
-                result[i] = (size_t(indices[i]) > data.size() ? naValue : data[indices[i] - 1]);
+                result[i] = ((indices[i] < 1 || size_t(indices[i]) > data.size()) ? naValue : data[indices[i] - 1]);
             return result;
         }
         else if (data.isFloatingPoint() || data.isScaled())
         {
             NumericVector result(indices.length());
             for (int i=0; i<indices.length(); i++)
-                result[i] = (size_t(indices[i]) > data.size() ? NA_REAL : data[indices[i] - 1]);
+                result[i] = ((indices[i] < 1 || size_t(indices[i]) > data.size()) ? NA_REAL : data[indices[i] - 1]);
             return result;
         }
         else
         {
             IntegerVector result(indices.length());
             for (int i=0; i<indices.length(); i++)
-                result[i] = (size_t(indices[i]) > data.size() ? NA_INTEGER : data[indices[i] - 1]);
+                result[i] = ((indices[i] < 1 || size_t(indices[i]) > data.size()) ? NA_INTEGER : data[indices[i] - 1]);
             
             if (data.isRgb())
             {
@@ -767,7 +777,7 @@ RcppExport SEXP indexList (SEXP _image, SEXP _indices)
 BEGIN_RCPP
     const NiftiImage image(_image, true, true);
     if (image.isNull())
-        Rf_error("Cannot index into a NULL image");
+        stop("Cannot index into a NULL image");
     else if (image->data == NULL)
         return LogicalVector(1, NA_LOGICAL);
     else
@@ -836,6 +846,140 @@ BEGIN_RCPP
         }
         // NB: the calling R code handles the dimension vector
     }
+END_RCPP
+}
+
+inline static double naPropagatingPlus (const double &x, const double &y)
+{
+    return (ISNA(x) || ISNA(y)) ? NA_REAL : x + y;
+}
+
+inline static double naPropagatingTimes (const double &x, const double &y)
+{
+    return (ISNA(x) || ISNA(y)) ? NA_REAL : x * y;
+}
+
+inline static double naDiscardingPlus (const double &x, const double &y)
+{
+    return (ISNA(x) ? 0.0 : x) + (ISNA(y) ? 0.0 : y);
+}
+
+inline static double naDiscardingTimes (const double &x, const double &y)
+{
+    return (ISNA(x) ? 1.0 : x) * (ISNA(y) ? 1.0 : y);
+}
+
+inline static double naDiscardingCount (const double &x, const double &y)
+{
+    return (ISNA(y) ? x : x + 1.0);
+}
+
+RcppExport SEXP summariseImage (SEXP _image, SEXP _generic, SEXP _na_rm)
+{
+BEGIN_RCPP
+    const NiftiImage image(_image, true, true);
+    const NiftiImageData data = image.data();
+    const size_t length = data.size();
+    const std::string generic = as<std::string>(_generic);
+    const bool dropNAs = as<bool>(_na_rm);
+
+    // Wrap output value in an RObject to ensure it is PROTECTed
+    RObject output;
+    
+    if (generic == "any" || generic == "all")
+        stop("Images do not have logical type, so \"any\" and \"all\" generics are invalid");
+    else if (data.isComplex() && (generic == "min" || generic == "max" || generic == "range"))
+        stop("Complex values don't have a simple ordering, so maxima and minima are ill-defined");
+    
+    if (data.isEmpty() || data.length() == 0)
+    {
+        Rf_warning("Taking summary value from an empty image");
+        if (generic == "max")           output = Rf_ScalarReal(R_NegInf);
+        else if (generic == "min")      output = Rf_ScalarReal(R_PosInf);
+        else if (generic == "range")    output = NumericVector::create(R_PosInf, R_NegInf);
+        else if (generic == "sum")      output = Rf_ScalarReal(0.0);
+        else if (generic == "mean")     output = Rf_ScalarReal(R_NaN);
+        else if (generic == "prod")     output = Rf_ScalarReal(1.0);
+        else                            stop("Unexpected generic name: \"%s\"", generic.c_str());
+    }
+    else if (data.isComplex())
+    {
+        // Complex min/max/range are rejected above, so only sum, mean and prod reach here
+        complex128_t result(generic == "prod" ? 1.0 : 0.0, 0.0);
+        bool foundNA = false;
+        size_t validCount = 0;
+        for (NiftiImageData::Iterator it=data.begin(); it!=data.end(); it++)
+        {
+            complex128_t value = *it;
+            if (RNifti::internal::isNA(value.real()) || RNifti::internal::isNA(value.imag()))
+            {
+                if (!dropNAs)
+                {
+                    foundNA = true;
+                    break;
+                }
+            }
+            else if (generic == "sum" || generic == "mean")
+            {
+                result += value;
+                validCount++;
+            }
+            else if (generic == "prod")
+                result *= value;
+            else
+                stop("Unexpected generic name: \"%s\"", generic.c_str());
+        }
+        if (foundNA)
+            output = Rf_ScalarComplex(complexNA());
+        else if (generic == "mean")
+        {
+            Rcomplex scalar;
+            const double divisor = dropNAs ? double(validCount) : double(length);
+            scalar.r = result.real() / divisor;
+            scalar.i = result.imag() / divisor;
+            output = Rf_ScalarComplex(scalar);
+        }
+        else
+            output = wrap(result);
+    }
+    else if (generic == "sum" || generic == "mean")
+    {
+        double result;
+        if (dropNAs)
+            result = std::accumulate(data.begin(), data.end(), 0.0, naDiscardingPlus);
+        else
+            result = std::accumulate(data.begin(), data.end(), 0.0, naPropagatingPlus);
+        
+        if (generic == "mean")
+        {
+            if (dropNAs)
+                result /= std::accumulate(data.begin(), data.end(), 0.0, naDiscardingCount);
+            else
+                result /= double(length);
+        }
+        
+        output = Rf_ScalarReal(result);
+    }
+    else if (generic == "prod")
+    {
+        double result;
+        if (dropNAs)
+            result = std::accumulate(data.begin(), data.end(), 1.0, naDiscardingTimes);
+        else
+            result = std::accumulate(data.begin(), data.end(), 1.0, naPropagatingTimes);
+        output = Rf_ScalarReal(result);
+    }
+    else
+    {
+        double min, max;
+        data.minmax(&min, &max, dropNAs);
+        if (generic == "max")           output = Rf_ScalarReal(max);
+        else if (generic == "min")      output = Rf_ScalarReal(min);
+        else if (generic == "range")    output = NumericVector::create(min, max);
+        else                            stop("Unexpected generic name: \"%s\"", generic.c_str());
+    }
+    
+    return output;
 END_RCPP
 }
 
@@ -910,10 +1054,12 @@ BEGIN_RCPP
             extensions.clear();
         else
         {
-            for (extension_list::iterator it=extensions.begin(); it!=extensions.end(); ++it)
+            for (extension_list::iterator it=extensions.begin(); it!=extensions.end(); )
             {
                 if (it->code() == code)
-                    extensions.erase(it);
+                    it = extensions.erase(it);
+                else
+                    ++it;
             }
         }
     }
@@ -956,6 +1102,7 @@ R_CallMethodDef callMethods[] = {
     { "hasData",        (DL_FUNC) &hasData,         1 },
     { "indexVector",    (DL_FUNC) &indexVector,     2 },
     { "indexList",      (DL_FUNC) &indexList,       2 },
+    { "summariseImage", (DL_FUNC) &summariseImage,  3 },
     { "rescaleImage",   (DL_FUNC) &rescaleImage,    2 },
     { "pointerToArray", (DL_FUNC) &pointerToArray,  1 },
     { "unwrapPointer",  (DL_FUNC) &unwrapPointer,   2 },

@@ -55,6 +55,16 @@
         on.exit(par(oldPars))
         image(indices, col=palette, axes=FALSE, asp=asp, add=add, zlim=c(1,length(palette)))
     }
+    else if (!is.null(names(layer$colours)))
+    {
+        # Discrete colouring via a named lookup table: map data values onto specific colour indices
+        # Values with no corresponding name in the table become NA, and so are not shown
+        indices <- match(as.character(data), names(layer$colours))
+        dim(indices) <- dims
+        oldPars <- par(mai=c(0,0,0,0))
+        on.exit(par(oldPars))
+        image(indices, col=unname(layer$colours), axes=FALSE, asp=asp, add=add, zlim=c(1,length(layer$colours)))
+    }
     else
     {
         # Other data is shown using standard image(), but zeroes are set to NA to make them transparent
@@ -99,8 +109,12 @@
 #'   greyscale, \code{"heat"} for a heatmap, \code{"rainbow"} for a rainbow
 #'   scale, or any of the scales defined in the \code{shades} package (see
 #'   \code{?shades::gradient}, if that package is installed). A fixed colour
-#'   can be used by wrapping a string in a call to \code{I}. Ignored for RGB
-#'   images.
+#'   can be used by wrapping a string in a call to \code{I}. If a \emph{named}
+#'   character vector is given instead, it is taken to be a lookup table
+#'   assigning specific colours to specific numerical values (named by the
+#'   value, as for \code{dict}), for categorical images such as atlases or
+#'   parcellations; any value without a matching name will not be shown.
+#'   Ignored for RGB images.
 #' @param min,max The window minimum and maximum for the layer, i.e., the black
 #'   and white points. These are ignored for RGB images. Otherwise, if
 #'   \code{NULL}, the default, they are taken from the \code{cal_min} or
@@ -114,6 +128,19 @@
 #'   that evaluate \code{FALSE} will be set to \code{NA} for that layer,
 #'   meaning they will not be plotted. This operation is performed last, and so
 #'   will not affect auto-windowing.
+#' @param alpha A single opacity value, between 0 (fully transparent) and 1
+#'   (fully opaque, the default), to apply to the layer's colour scale.
+#'   Setting this requires the \code{shades} package.
+#' @param label An optional character string overriding the default label for
+#'   the layer, which is otherwise obtained by deparsing the \code{image}
+#'   argument.
+#' @param dict An optional named vector or list giving a dictionary of labels
+#'   for particular numerical values in the image, for layers whose values are
+#'   categorical rather than continuous (e.g., an atlas image with regions of
+#'   interest indicated by integer codes). Names should be the numeric codes,
+#'   coerced to strings, and values the corresponding labels. If given, these
+#'   labels will be shown instead of raw numbers in the default information
+#'   panel.
 #' @return \code{lyr} returns a list of class \code{"viewLayer"}, to be used
 #'   in a view. \code{view} is called for its side-effect of showing a view.
 #' 
@@ -227,6 +254,15 @@ view <- function (..., point = NULL, radiological = getOption("radiologicalView"
                 result <- do.call("[", c(list(layer$image), indices[seq_len(ndim(layer$image))]))
                 if (inherits(layer$image, "rgbArray"))
                     return (as.character(structure(result, dim=c(1,length(result)), class="rgbArray")))
+                else if (!is.null(layer$dict))
+                {
+                    # Look up each value in the dictionary, falling back to the raw value if it isn't found
+                    labels <- unname(layer$dict[as.character(result)])
+                    found <- !is.na(labels)
+                    labels[found] <- paste0(labels[found], " (", result[found], ")")
+                    labels[!found] <- as.character(result[!found])
+                    return (labels)
+                }
                 else
                     return (result)
             })
@@ -300,15 +336,34 @@ view <- function (..., point = NULL, radiological = getOption("radiologicalView"
 
 #' @rdname view
 #' @export
-lyr <- function (image, scale = "grey", min = NULL, max = NULL, mask = NULL)
+lyr <- function (image, scale = "grey", min = NULL, max = NULL, mask = NULL, alpha = 1, label = NULL, dict = NULL)
 {
-    label <- deparse(substitute(image))
+    if (is.null(label))
+        label <- deparse(substitute(image))
     image <- asNifti(image, internal=FALSE)
+    
+    if (!is.null(dict) && is.null(names(dict)))
+        stop("The \"dict\" argument must be a named vector or list, giving labels for particular numeric values")
+    
+    # A named "scale" is a lookup table assigning colours to specific values, for categorical images
+    discrete <- is.character(scale) && !is.null(names(scale))
     
     if (inherits(image, "rgbArray"))
         colours <- window <- NULL
+    else if (discrete)
+    {
+        colours <- scale
+        if (is.numeric(alpha) && !is.na(alpha) && alpha != 1)
+        {
+            # shades::opacity() does not preserve names, so these must be reattached
+            colours <- unclass(shades::opacity(colours, alpha))
+            names(colours) <- names(scale)
+        }
+        window <- NULL
+    }
     else
     {
+        colours <- NULL
         if (is.character(scale) && length(scale) == 1 && !inherits(scale,"AsIs"))
             colours <- try(switch(scale, grey=gray(0:99/99), gray=gray(0:99/99), greyscale=gray(0:99/99), grayscale=gray(0:99/99), heat=heat.colors(100), rainbow=rainbow(100,start=0.7,end=0.1), unclass(shades::gradient(scale,100))), silent=TRUE)
         
@@ -316,6 +371,12 @@ lyr <- function (image, scale = "grey", min = NULL, max = NULL, mask = NULL)
         # Ditto if it was surrounded by I() so as to make it of class "AsIs"
         if (is.null(colours) || inherits(colours, "try-error"))
             colours <- unclass(scale)
+        
+        if (is.numeric(alpha) && !is.na(alpha) && alpha != 1)
+            colours <- unclass(shades::opacity(colours, alpha))
+        
+        # Make sure colours are unnamed in this branch, otherwise they will be treated as a lookup table
+        names(colours) <- NULL
         
         if (is.null(min))
             min <- image$cal_min
@@ -353,7 +414,7 @@ lyr <- function (image, scale = "grey", min = NULL, max = NULL, mask = NULL)
             image[!as.logical(mask)] <- NA
     }
     
-    return (structure(list(image=image, label=label, colours=colours, window=window), class="viewLayer"))
+    return (structure(list(image=image, label=label, colours=colours, window=window, dict=dict), class="viewLayer"))
 }
 
 .quitInstructions <- function ()
@@ -400,7 +461,7 @@ defaultInfoPanel <- function (point, data, labels)
                 data[[i]]
         }, labels[i])
     }
-    text(0.5, yLocs, rev(text), col=c(rep(c("white","red"),nImages),"grey70"), cex=pmin(1,1/strwidth(rev(text))), xpd=TRUE)
+    text(0.5, yLocs, rev(text), col=c(rep(c("white","red"),nImages),"grey70"), cex=pmin(1,1/strwidth(rev(text))), font=c(rep(c(2,1),nImages),3), xpd=TRUE)
 }
 
 #' @rdname defaultInfoPanel

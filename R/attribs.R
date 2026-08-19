@@ -71,10 +71,19 @@ imageAttributes <- function (x)
     if (!inherits(x, "niftiImage"))
         return (x)
     attribs <- attributes(x)
-    if (length(attribs) == 0L || is.null(names(attribs)))
-        return (x)
-    attribs <- attribs[grepl(.RNiftiAttribs,names(attribs),perl=TRUE) | names(attribs) == ""]
-    attributes(x) <- c(attribs, as.list(value))
+    value <- as.list(value)
+    
+    # Keep the core attributes unmodified
+    if (length(attribs) > 0L && !is.null(names(attribs)))
+        attribs <- attribs[grepl(.RNiftiAttribs,names(attribs),perl=TRUE) | names(attribs) == ""]
+    
+    # Warn if the user tried to modify them
+    coreNameValue <- grepl(.RNiftiAttribs, names(value), perl=TRUE)
+    if (any(coreNameValue))
+        warning("imageAttributes() cannot be used to modify core attributes (", paste(names(value[coreNameValue]), collapse=", "), ")")
+    
+    # An empty value isn't a no-op if the image previously had other attributes
+    attributes(x) <- c(attribs, value[!coreNameValue & names(value) != ""])
     return (x)
 }
 
@@ -92,10 +101,10 @@ renameFromBids <- function (bids)
         if (is.character(value) && all(grepl("^\\s*$", value, perl=TRUE)))
             next
         
-        if (bidsName == "PhaseEncodingDirection" && grepl("^([ijk])(-)?$", value, perl=TRUE))
+        if (bidsName == "PhaseEncodingDirection" && all(grepl("^([ijk])([+-])?$", value, perl=TRUE)))
         {
             tractor$phaseEncodingDirection <- substring(value,1,1)
-            tractor$phaseEncodingSign <- ifelse(nchar(value)==1L, 1L, -1L)
+            tractor$phaseEncodingSign <- ifelse(substring(value,2,2)=="-", -1L, 1L)
             next
         }
         

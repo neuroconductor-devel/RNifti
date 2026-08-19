@@ -2,6 +2,95 @@ Significant changes to the RNifti package are laid out below for each release.
 
 ===============================================================================
 
+VERSION 1.10.0
+
+R interface
+
+- Methods for `asNifti()` are now discoverable by the package's C++ core, which
+  significantly reduces the need to call the function explicitly, which in turn
+  can save some data copying. The `reference` argument is no longer part of the
+  generic's signature. Conversion of `"nifti"` and `"MriImage"` objects, from
+  the `oro.nifti` and `tractor.base` packages, respectively, is now performed
+  by pure-R methods rather than being hardcoded into the C++ layer, a change
+  which ends up being performance-neutral (or even an improvement) due to fewer
+  calls into the R API.
+- `lyr()` gains new `label`, `alpha` and `dict` arguments, for naming a layer
+  explicitly (rather than relying on argument deparsing), setting layer opacity
+  and mapping intensity values to arbitrary text, respectively. Its `scale`
+  argument may now be a named vector, which is used as a discrete colour lookup
+  table keyed by intensity value, rather than a continuous colour scale.
+- Assigning pixel dimensions with `pixdim<-` now produces an error if the
+  replacement value's length doesn't match the image's dimensionality, rather
+  than silently applying it incorrectly.
+- Setting the world-coordinate transformation of a `niftiHeader` object with
+  `qform<-` or `sform<-` no longer has the side effect of overwriting its pixel
+  dimensions, except for the sign of the first element (the "qfac").
+- `writeNifti()`'s `version` argument is now validated, and may be given as a
+  string (`"1"` or `"2"`) as well as numerically.
+- Assigning to `imageAttributes()` now produces a warning, rather than
+  silently doing nothing, if the assignment would overwrite a core NIfTI
+  attribute. It also now works correctly when the target object has no
+  pre-existing attributes.
+- The `mean()` method for internal images now uses the same C++ back-end as the
+  `Summary` group generic, thereby avoiding first converting the image to a
+  full array.
+
+API changes
+
+- A bug in the `acquire()`/`release()` reference-counting cycle in the
+  `NiftiImage` C++ class has been fixed. Previously, changing the pointer
+  wrapped by a `NiftiImage` object by copy-assignment could decrement the wrong
+  reference counter, risking a premature deallocation. `acquire()` now takes an
+  optional existing reference counter to take over, rather than relying on it
+  having already been set as a side effect by the caller.
+- Converting a NIfTI-2 image containing more voxels than a NIfTI-1 image can
+  represent now fails with an informative error, rather than silently
+  overflowing.
+
+Other changes
+
+- Reading corrupt or truncated image data now produces clearer, more
+  informative errors.
+- A memory leak affecting the internal per-datatype handler on copy
+  assignment of a `NiftiImage`, and undefined behaviour arising from use of
+  an iterator after erasing the element it points to, have both been fixed.
+- C++ exceptions are now consistently raised using `Rcpp::stop()` rather than
+  `Rf_error()`, ensuring correct stack unwinding.
+
+===============================================================================
+
+VERSION 1.9.0
+
+- Methods for the `Math`, `Ops`, `Complex` and `Summary` group generics have
+  been added for the `internalImage` class, as well as `is.na()` and `mean()`.
+  This prevents R from falling back on the `character` methods, which aren't
+  helpful. In most cases these implementations simply call the relevant generic
+  on the array version of the image; the exception is `Summary`, which calls a
+  C++ implementation to avoid allocating memory for an R array when only a
+  summary value is needed. (Reported by Martin Wilson, issue #39 and `divest`
+  issue #6.)
+- Image value range calculation and NA handling in the core C++ code has been
+  improved, particularly for the 32-bit integer datatype.
+
+===============================================================================
+
+VERSION 1.8.0
+
+- It is now possible to read, write and manipulate additional image metadata
+  fields stored in JSON "sidecar" files like those used by the [Brain Imaging
+  Data Structure](https://bids.neuroimaging.io). `readNifti` and `writeNifti`
+  each gain a "json" argument, and the new `imageAttributes` function can be
+  used to get and set attributes for images. Conversion to or from JSON
+  requires the [`jsonlite`](https://github.com/jeroen/jsonlite) package; this
+  is an R-only feature for now.
+- If a plain string is passed to `lyr` as the "scale" argument and doesn't
+  match a known scale name from the `shades` package, it is now assumed to be
+  a single literal colour name. (Prompted by Ellyn Butler, issue #36.)
+- Initialisation of the complex `NA` value in C++ code has been simplified to
+  avoid remaining compilation problems on some platforms. (Issues #35 and #38.)
+
+===============================================================================
+
 VERSION 1.7.0
 
 - Indexing into an `rgbArray` or an RGB-valued `internalImage` now produces a

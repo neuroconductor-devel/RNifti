@@ -8,6 +8,7 @@
 
 #else
 
+#define R_PosInf INFINITY
 #define R_NegInf -INFINITY
 
 #include <stdint.h>
@@ -85,7 +86,7 @@ protected:
         virtual void setDouble (void *ptr, const double value) const {}
         virtual void setInt (void *ptr, const int value) const {}
         virtual void setRgb (void *ptr, const rgba32_t value) const {}
-        virtual void minmax (void *ptr, const size_t length, double *min, double *max) const { *min = 0.0; *max = 0.0; }
+        virtual void minmax (void *ptr, const size_t length, double *min, double *max, const bool dropNaN = true) const { *min = R_PosInf; *max = R_NegInf; }
     };
     
     /**
@@ -99,15 +100,33 @@ protected:
         complex128_t getComplex (void *ptr) const { return complex128_t(static_cast<double>(*static_cast<Type*>(ptr)), 0.0); }
         double getDouble (void *ptr) const { return static_cast<double>(*static_cast<Type*>(ptr)); }
         int getInt (void *ptr) const { return static_cast<int>(*static_cast<Type*>(ptr)); }
-        void setComplex (void *ptr, const complex128_t value) const
-        {
-            *(static_cast<Type*>(ptr)) = Type(value.real());
-            *(static_cast<Type*>(ptr) + 1) = Type(0);
-        }
         void setDouble (void *ptr, const double value) const { *(static_cast<Type*>(ptr)) = Type(value); }
         void setInt (void *ptr, const int value) const { *(static_cast<Type*>(ptr)) = Type(value); }
-        void minmax (void *ptr, const size_t length, double *min, double *max) const;
+        void minmax (void *ptr, const size_t length, double *min, double *max, const bool dropNaN = true) const;
     };
+
+#ifdef USING_R
+    template <bool alpha>
+    struct ConcreteTypeHandler<int,alpha> : public TypeHandler
+    {
+        size_t size () const { return (sizeof(int)); }
+        bool hasNaN () const { return true; }
+        complex128_t getComplex (void *ptr) const {
+            int value = *static_cast<int*>(ptr);
+            return complex128_t(value == NA_INTEGER ? NA_REAL : static_cast<double>(value), 0.0);
+        }
+        double getDouble (void *ptr) const {
+            int value = *static_cast<int*>(ptr);
+            return (value == NA_INTEGER ? NA_REAL : static_cast<double>(value));
+        }
+        int getInt (void *ptr) const { return *static_cast<int*>(ptr); }
+        void setDouble (void *ptr, const double value) const {
+            *(static_cast<int*>(ptr)) = ISNA(value) ? NA_INTEGER : int(value);
+        }
+        void setInt (void *ptr, const int value) const { *(static_cast<int*>(ptr)) = value; }
+        void minmax (void *ptr, const size_t length, double *min, double *max, const bool dropNaN = true) const;
+    };
+#endif
     
     template <typename ElementType>
     struct ConcreteTypeHandler<std::complex<ElementType>,false> : public TypeHandler
@@ -131,7 +150,10 @@ protected:
         void setComplex (void *ptr, const complex128_t value) const { setNative(ptr, std::complex<ElementType>(value)); }
         void setDouble (void *ptr, const double value) const { setNative(ptr, std::complex<ElementType>(value, 0.0)); }
         void setInt (void *ptr, const int value) const { setNative(ptr, std::complex<ElementType>(static_cast<ElementType>(value), 0.0)); }
-        void minmax (void *ptr, const size_t length, double *min, double *max) const;
+        void minmax (void *ptr, const size_t length, double *min, double *max, const bool dropNaN = true)
+        {
+            throw std::runtime_error("Complex values don't have a simple ordering, so maxima and minima are ill-defined");
+        };
     };
     
     template <bool alpha>
@@ -157,7 +179,7 @@ protected:
             unsigned char *target = static_cast<unsigned char *>(ptr);
             std::copy(value.value.bytes, value.value.bytes + (alpha ? 4 : 3), target);
         }
-        void minmax (void *ptr, const size_t length, double *min, double *max) const { *min = 0.0; *max = 255.0; }
+        void minmax (void *ptr, const size_t length, double *min, double *max, const bool dropNaN = true) const { *min = 0.0; *max = 255.0; }
     };
     
     /**
@@ -501,6 +523,7 @@ public:
     {
         if (source.dataPtr != NULL)
         {
+            delete handler;
             // Free the old data, if we allocated it
             if (owner)
                 free(dataPtr);
@@ -603,26 +626,21 @@ public:
      *   datatype is unknown or the data is empty
      * @param max Pointer to the maximum value (output parameter). Will be set to zero if the
      *   datatype is unknown or the data is empty
+     * @param dropNaN Boolean value indicating whether missing/NaN values should be ignored.
+     *   This is analogous to the \c na.rm argument in R. If \c false, and a NaN value is
+     *   encountered, then the results will both be NaN
     **/
-    void minmax (double *min, double *max) const
+    void minmax (double *min, double *max, const bool dropNaN = true) const
     {
         if (handler == NULL)
         {
-            *min = 0.0;
-            *max = 0.0;
+            *min = R_PosInf;
+            *max = R_NegInf;
         }
         else
-            handler->minmax(dataPtr, _length, min, max);
+            handler->minmax(dataPtr, _length, min, max, dropNaN);
     }
 };
-
-
-// R provides an NaN (NA) value for integers
-#ifdef USING_R
-template <>
-inline bool NiftiImageData::ConcreteTypeHandler<int>::hasNaN () const { return true; }
-#endif
-
 
 /**
  * A simple object-oriented wrapper around a fixed-length array.
@@ -1025,7 +1043,7 @@ public:
                     copy(string, strlen(string), code);
                     break;
                 }
-                default: Rf_error("Unable to convert SEXP type %d to NIfTI extension", object.sexp_type());
+                default: Rcpp::stop("Unable to convert SEXP type %d to NIfTI extension", object.sexp_type());
             }
         }
 #endif
@@ -1271,11 +1289,13 @@ protected:
     
     /**
      * Acquire the specified pointer to a \c nifti_image \c struct, taking (possibly shared)
-     * responsibility for freeing the associated memory. If the object currently wraps another
-     * pointer, it will be released
+     * responsibility for freeing the associated memory. If this object currently wraps another
+     * pointer, it will be released first
      * @param image The pointer to wrap
+     * @param refCount An existing reference counter to carry over, where applicable. This should
+     * be left at the default of \c NULL for most purposes
     **/
-    void acquire (nifti_image * const image);
+    void acquire (nifti_image * const image, int * const refCount = NULL);
     
     /**
      * Acquire the same pointer as another \c NiftiImage, incrementing the shared reference count
@@ -1283,8 +1303,7 @@ protected:
     **/
     void acquire (const NiftiImage &source)
     {
-        refCount = source.refCount;
-        acquire(source.image);
+        acquire(source.image, source.refCount);
     }
     
     /**
@@ -1315,20 +1334,6 @@ protected:
 #ifdef USING_R
 
     /**
-     * Initialise the object from an S4 object of class \c "nifti"
-     * @param object The source object
-     * @param copyData If \c true, the data are copied in; otherwise just the metadata is extracted
-    **/
-    void initFromNiftiS4 (const Rcpp::RObject &object, const bool copyData = true);
-    
-    /**
-     * Initialise the object from a reference object of class \c "MriImage"
-     * @param object The source object
-     * @param copyData If \c true, the data are copied in; otherwise just the metadata is extracted
-    **/
-    void initFromMriImage (const Rcpp::RObject &object, const bool copyData = true);
-    
-    /**
      * Initialise the object from an R list with named elements, which can only contain metadata
      * @param object The source object
     **/
@@ -1340,7 +1345,21 @@ protected:
      * @param copyData If \c true, the data are copied in; otherwise just the metadata is extracted
     **/
     void initFromArray (const Rcpp::RObject &object, const bool copyData = true);
-   
+    
+    /**
+     * Initialise the object from an arbitrary SEXP, as for the corresponding public constructor.
+     * This does the actual work for that constructor, taking an explicit recursion depth so that
+     * a badly-behaved user-defined \c asNifti() method that fails to convert its input into a
+     * recognisable form cannot cause indefinite recursion
+     * @param object The source object
+     * @param readData If \c true, the pixel data will be retrieved; if not, only the metadata
+     * @param readOnly If \c true, the pointer to the source will always be duplicated to obtain
+     * a new copy, if it is currently shared with the R interpreter
+     * @param depth The current recursion depth, from repeated attempts to resolve the object via
+     * a user-defined \c asNifti() method. Capped at a small constant to guarantee termination
+    **/
+    void initFromSexp (const SEXP object, const bool readData, const bool readOnly, const int depth = 0);
+    
 #endif
     
     /**

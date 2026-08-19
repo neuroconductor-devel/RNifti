@@ -112,6 +112,55 @@ as.array.internalImage <- function (x, ...)
 }
 
 #' @export
+Math.internalImage <- function (x, ...)
+{
+    do.call(.Generic, alist(as.array(x), ...))
+}
+
+#' @export
+Ops.internalImage <- function (e1, e2)
+{
+    if (inherits(e1, "internalImage"))
+        e1 <- as.array(e1)
+    if (!missing(e2) && inherits(e2, "internalImage"))
+        e2 <- as.array(e2)
+    do.call(.Generic, alist(e1, e2))
+}
+
+#' @export
+Complex.internalImage <- function (z)
+{
+    do.call(.Generic, alist(as.array(z)))
+}
+
+#' @export
+Summary.internalImage <- function (..., na.rm = FALSE)
+{
+    objects <- list(...)
+    if (length(objects) == 1L)
+        .Call("summariseImage", objects[[1]], .Generic, na.rm, PACKAGE="RNifti")
+    else
+        do.call(.Generic, c(lapply(objects, function(obj) {
+            if (inherits(obj, "internalImage"))
+                .Call("summariseImage", obj, .Generic, na.rm, PACKAGE="RNifti")
+            else
+                obj
+        }), list(na.rm=na.rm)))
+}
+
+#' @export
+is.na.internalImage <- function (x)
+{
+    is.na(as.array(x))
+}
+
+#' @export
+mean.internalImage <- function (x, na.rm = FALSE, ...)
+{
+    .Call("summariseImage", x, "mean", na.rm, PACKAGE="RNifti")
+}
+
+#' @export
 print.niftiImage <- function (x, ...)
 {
     dim <- dim(x)
@@ -229,6 +278,8 @@ pixdim.default <- function (object)
             attr(object, "pixdim") <- value
         else if (length(value) == 1)
             attr(object, "pixdim") <- rep(value, ndim(object))
+        else
+            stop("Pixel dimensions don't match the dimensionality of the image")
     }
     return (object)
 }

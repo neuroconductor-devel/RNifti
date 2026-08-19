@@ -29,10 +29,7 @@ inline bool isNA<int> (const int x) { return (x == NA_INTEGER); }
 
 template <>
 inline bool isNA<double> (const double x) { return ISNA(x); }
-#endif
-
-template <typename Type>
-inline bool lessThan (Type a, Type b) { return (!isNaN(a) && !isNaN(b) && a < b); }
+#endif  // USING_R
 
 inline double roundEven (const double value)
 {
@@ -128,6 +125,9 @@ inline nifti1_image * convertImageV2to1 (nifti2_image *image)
     
     // We assume that each block of a given type is stored contiguously like an array - this should be the case, but may not be guaranteed
     std::transform(&image->ndim, &image->ndim + 16, &result->ndim, ElementConverter<int>());
+    // The nvox field affects memory allocation, so we don't want it to be out of bounds
+    if (image->nvox > int64_t(std::numeric_limits<int>::max()))
+        throw std::runtime_error("NIfTI-2 image array is too large to fit within a NIfTI-1 image");
     result->nvox = static_cast<int>(image->nvox);
     std::copy(&image->nbyper, &image->nbyper + 2, &result->nbyper);
     std::transform(&image->dx, &image->dx + 19, &result->dx, ElementConverter<float>());
@@ -359,6 +359,28 @@ inline void updateHeader (nifti_1_header *header, const Rcpp::List &list, const 
         strcpy(header->magic, Rcpp::as<std::string>(list["magic"]).substr(0,3).c_str());
 }
 
+// Look for a user-supplied asNifti() S3 method for an object of an unrecognised class, calling
+// it directly if one is found - bypassing standard method dispatch, which would otherwise fall
+// back to asNifti.default(), and hence back into this same constructor with the same
+// unconvertible object, looping forever. Returns R_NilValue if no applicable method exists.
+// The method table lookup itself is delegated to utils::getS3method(), rather than reimplemented
+// natively, since S3 dispatch resolution relies on R internals that aren't part of the public API
+inline Rcpp::RObject tryCustomAsNifti (const Rcpp::RObject &object)
+{
+    static Rcpp::Function getS3method = Rcpp::Environment::namespace_env("utils")["getS3method"];
+    const Rcpp::CharacterVector classes = object.attr("class");
+    for (R_xlen_t i=0; i<classes.size(); i++)
+    {
+        const Rcpp::RObject method = getS3method("asNifti", Rcpp::as<std::string>(classes[i]), Rcpp::Named("optional")=true);
+        if (!Rf_isNull(method))
+        {
+            Rcpp::Function methodFunction(method);
+            return methodFunction(object);
+        }
+    }
+    return R_NilValue;
+}
+
 inline void addAttributes (const SEXP pointer, const NiftiImage &source, const bool realDim = true, const bool includeXptr = true, const bool keepData = true)
 {
     const int nDims = source->dim[0];
@@ -398,57 +420,77 @@ inline void addAttributes (const SEXP pointer, const NiftiImage &source, const b
 
 #endif  // USING_R
 
-}       // internal namespace
-
-template <typename Type, bool alpha>
-inline void NiftiImageData::ConcreteTypeHandler<Type,alpha>::minmax (void *ptr, const size_t length, double *min, double *max) const
+// Generic implementation of minmax method
+template <typename Type>
+inline void minmax (void *ptr, const size_t length, double *min, double *max, const bool dropNaN)
 {
-    if (ptr == NULL || length < 1)
+    if (ptr == NULL)
     {
+        // If no data is passed, return the limits of the type
         *min = static_cast<double>(std::numeric_limits<Type>::min());
         *max = static_cast<double>(std::numeric_limits<Type>::max());
     }
     else
     {
         Type *loc = static_cast<Type*>(ptr);
-        Type currentMin = *loc, currentMax = *loc;
-        for (size_t i=1; i<length; i++)
+        Type currentMin, currentMax;
+        bool started = false;
+        for (size_t i=0; i<length; i++, loc++)
         {
-            loc++;
-            if (internal::lessThan(*loc, currentMin))
-                currentMin = *loc;
-            if (internal::lessThan(currentMax, *loc))
-                currentMax = *loc;
+            if (internal::isNaN(*loc))
+            {
+                // If we're not dropping NaNs then encountering one is a stop condition
+                if (!dropNaN)
+                {
+                    // Try and preserve NAs; otherwise use a generic NaN
+#ifdef USING_R
+                    if (internal::isNA(*loc))
+                        *min = *max = NA_REAL;
+                    else
+#endif
+                        *min = *max = std::numeric_limits<double>::quiet_NaN();
+                    return;
+                }
+            }
+            else
+            {
+                if (!started || *loc < currentMin)
+                    currentMin = *loc;
+                if (!started || *loc > currentMax)
+                    currentMax = *loc;
+                started = true;
+            }
         }
-        *min = static_cast<double>(currentMin);
-        *max = static_cast<double>(currentMax);
+        
+        if (started)
+        {
+            *min = static_cast<double>(currentMin);
+            *max = static_cast<double>(currentMax);
+        }
+        else
+        {
+            // We didn't see any non-NaN value
+            *min = R_PosInf;
+            *max = R_NegInf;
+        }
     }
 }
 
-template <typename ElementType>
-inline void NiftiImageData::ConcreteTypeHandler<std::complex<ElementType>,false>::minmax (void *ptr, const size_t length, double *min, double *max) const
+}       // internal namespace
+
+template <typename Type, bool alpha>
+inline void NiftiImageData::ConcreteTypeHandler<Type,alpha>::minmax (void *ptr, const size_t length, double *min, double *max, const bool dropNaN) const
 {
-    if (ptr == NULL || length < 1)
-    {
-        *min = static_cast<double>(std::numeric_limits<ElementType>::min());
-        *max = static_cast<double>(std::numeric_limits<ElementType>::max());
-    }
-    else
-    {
-        ElementType *loc = static_cast<ElementType*>(ptr);
-        ElementType currentMin = *loc, currentMax = *loc;
-        for (size_t i=1; i<(2*length); i++)
-        {
-            loc++;
-            if (internal::lessThan(*loc, currentMin))
-                currentMin = *loc;
-            if (internal::lessThan(currentMax, *loc))
-                currentMax = *loc;
-        }
-        *min = static_cast<double>(currentMin);
-        *max = static_cast<double>(currentMax);
-    }
+    internal::minmax<Type>(ptr, length, min, max, dropNaN);
 }
+
+#ifdef USING_R
+template <bool alpha>
+inline void NiftiImageData::ConcreteTypeHandler<int,alpha>::minmax (void *ptr, const size_t length, double *min, double *max, const bool dropNaN) const
+{
+    internal::minmax<int>(ptr, length, min, max, dropNaN);
+}
+#endif
 
 template <typename SourceType>
 inline NiftiImageData::Element & NiftiImageData::Element::operator= (const SourceType &value)
@@ -692,7 +734,7 @@ inline int NiftiImage::fileVersion (const std::string &path)
 #endif
 }
 
-inline void NiftiImage::acquire (nifti_image * const image)
+inline void NiftiImage::acquire (nifti_image * const image, int * const refCount)
 {
     // If we're taking ownership of a new image, release the old one
     if (this->image != NULL && this->image != image)
@@ -702,10 +744,13 @@ inline void NiftiImage::acquire (nifti_image * const image)
     this->image = image;
     if (image != NULL)
     {
-        if (this->refCount == NULL)
-            this->refCount = new int(1);
+        if (refCount != NULL)
+        {
+            this->refCount = refCount;
+            (*refCount)++;
+        }
         else
-            (*this->refCount)++;
+            this->refCount = new int(1);
         
 #ifndef NDEBUG
         Rc_printf("Acquiring pointer %p (v%d; reference count is %d)\n", (void *) this->image, RNIFTI_NIFTILIB_VERSION, *this->refCount);
@@ -735,8 +780,10 @@ inline void NiftiImage::release ()
                 this->refCount = NULL;
             }
         }
+#ifndef NDEBUG
         else
             Rc_printf("Releasing untracked object %p", (void *) this->image);
+#endif
     }
 }
 
@@ -811,193 +858,6 @@ inline void NiftiImage::copy (const Block &source)
 }
 
 #ifdef USING_R
-
-// Convert an S4 "nifti" object, as defined in the oro.nifti package, to a "nifti_image" struct
-inline void NiftiImage::initFromNiftiS4 (const Rcpp::RObject &object, const bool copyData)
-{
-    nifti_1_header header;
-    header.sizeof_hdr = 348;
-    
-    const std::vector<dim_t> dims = object.slot("dim_");
-    for (int i=0; i<8; i++)
-        header.dim[i] = dims[i];
-    
-    header.intent_p1 = object.slot("intent_p1");
-    header.intent_p2 = object.slot("intent_p2");
-    header.intent_p3 = object.slot("intent_p3");
-    header.intent_code = object.slot("intent_code");
-    
-    header.datatype = object.slot("datatype");
-    header.bitpix = object.slot("bitpix");
-    
-    header.slice_start = object.slot("slice_start");
-    header.slice_end = object.slot("slice_end");
-    header.slice_code = Rcpp::as<int>(object.slot("slice_code"));
-    header.slice_duration = object.slot("slice_duration");
-    
-    const std::vector<pixdim_t> pixdims = object.slot("pixdim");
-    for (int i=0; i<8; i++)
-        header.pixdim[i] = pixdims[i];
-    header.xyzt_units = Rcpp::as<int>(object.slot("xyzt_units"));
-    
-    header.vox_offset = object.slot("vox_offset");
-    
-    // oro.nifti does its own data rescaling, so we ignore the slope and intercept fields
-    header.scl_slope = 0.0;
-    header.scl_inter = 0.0;
-    header.toffset = object.slot("toffset");
-    
-    header.cal_max = object.slot("cal_max");
-    header.cal_min = object.slot("cal_min");
-    header.glmax = header.glmin = 0;
-    
-    strncpy(header.descrip, Rcpp::as<std::string>(object.slot("descrip")).c_str(), 79);
-    header.descrip[79] = '\0';
-    strncpy(header.aux_file, Rcpp::as<std::string>(object.slot("aux_file")).c_str(), 23);
-    header.aux_file[23] = '\0';
-    strncpy(header.intent_name, Rcpp::as<std::string>(object.slot("intent_name")).c_str(), 15);
-    header.intent_name[15] = '\0';
-    strncpy(header.magic, Rcpp::as<std::string>(object.slot("magic")).c_str(), 3);
-    header.magic[3] = '\0';
-    
-    header.qform_code = object.slot("qform_code");
-    header.sform_code = object.slot("sform_code");
-    
-    header.quatern_b = object.slot("quatern_b");
-    header.quatern_c = object.slot("quatern_c");
-    header.quatern_d = object.slot("quatern_d");
-    header.qoffset_x = object.slot("qoffset_x");
-    header.qoffset_y = object.slot("qoffset_y");
-    header.qoffset_z = object.slot("qoffset_z");
-    
-    const std::vector<Xform::Element> srow_x = object.slot("srow_x");
-    const std::vector<Xform::Element> srow_y = object.slot("srow_y");
-    const std::vector<Xform::Element> srow_z = object.slot("srow_z");
-    for (int i=0; i<4; i++)
-    {
-        header.srow_x[i] = srow_x[i];
-        header.srow_y[i] = srow_y[i];
-        header.srow_z[i] = srow_z[i];
-    }
-    
-    // Ignoring complex and RGB types here because oro.nifti doesn't yet support them
-    if (header.datatype == DT_UINT8 || header.datatype == DT_INT16 || header.datatype == DT_INT32 || header.datatype == DT_INT8 || header.datatype == DT_UINT16 || header.datatype == DT_UINT32)
-        header.datatype = DT_INT32;
-    else if (header.datatype == DT_FLOAT32 || header.datatype == DT_FLOAT64)
-        header.datatype = DT_FLOAT64;
-    else
-        throw std::runtime_error("Data type is not supported");
-    
-#if RNIFTI_NIFTILIB_VERSION == 1
-    acquire(nifti_convert_nhdr2nim(header, NULL));
-#elif RNIFTI_NIFTILIB_VERSION == 2
-    acquire(nifti_convert_n1hdr2nim(header, NULL));
-#endif
-    
-    const Rcpp::RObject data = object.slot(".Data");
-    if (!copyData || Rf_length(data) <= 1)
-        this->image->data = NULL;
-    else if (header.datatype == DT_INT32)
-    {
-        Rcpp::IntegerVector intData(data);
-        replaceData(NiftiImageData(intData.begin(), intData.end(), DT_INT32));
-    }
-    else
-    {
-        Rcpp::DoubleVector doubleData(data);
-        replaceData(NiftiImageData(doubleData.begin(), doubleData.end(), DT_FLOAT64));
-    }
-}
-
-inline void NiftiImage::initFromMriImage (const Rcpp::RObject &object, const bool copyData)
-{
-    Rcpp::Reference mriImage(object);
-    Rcpp::Function getXform = mriImage.field("getXform");
-    Rcpp::NumericMatrix xform = getXform();
-    
-    acquire(NULL);
-    
-    if (Rf_length(mriImage.field("tags")) > 0)
-        initFromList(mriImage.field("tags"));
-    
-    Rcpp::RObject data = mriImage.field("data");
-    if (data.inherits("SparseArray"))
-    {
-        Rcpp::Language call("as.array", data);
-        data = call.eval();
-    }
-    
-    int datatype = (Rf_isNull(data) ? DT_INT32 : sexpTypeToNiftiType(data.sexp_type()));
-    if (data.inherits("rgbArray"))
-    {
-        const int channels = (data.hasAttribute("channels") ? data.attr("channels") : 3);
-        datatype = (channels == 4 ? DT_RGBA32 : DT_RGB24);
-    }
-    
-    dim_t dims[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-    const std::vector<dim_t> dimVector = mriImage.field("imageDims");
-    const int nDims = std::min(7, int(dimVector.size()));
-    dims[0] = nDims;
-    size_t nVoxels = 1;
-    for (int i=0; i<nDims; i++)
-    {
-        dims[i+1] = dimVector[i];
-        nVoxels *= dimVector[i];
-    }
-    
-    if (this->image == NULL)
-    {
-#if RNIFTI_NIFTILIB_VERSION == 1
-        acquire(nifti_make_new_nim(dims, datatype, FALSE));
-#elif RNIFTI_NIFTILIB_VERSION == 2
-        acquire(nifti2_make_new_nim(dims, datatype, FALSE));
-#endif
-    }
-    else
-    {
-        std::copy(dims, dims+8, this->image->dim);
-        this->image->datatype = datatype;
-        nifti_datatype_sizes(image->datatype, &image->nbyper, NULL);
-    }
-    
-    if (copyData && !Rf_isNull(data))
-    {
-        // NB: nifti_get_volsize() will not be right here if there were tags
-        const size_t dataSize = nVoxels * image->nbyper;
-        this->image->data = calloc(1, dataSize);
-        if (datatype == DT_INT32 || datatype == DT_RGBA32)
-            memcpy(this->image->data, INTEGER(data), dataSize);
-        else if (datatype == DT_RGB24)
-        {
-            NiftiImageData newData(image);
-            std::copy(INTEGER(data), INTEGER(data)+nVoxels, newData.begin());
-        }
-        else if (datatype == DT_COMPLEX128)
-            memcpy(this->image->data, COMPLEX(data), dataSize);
-        else
-            memcpy(this->image->data, REAL(data), dataSize);
-    }
-    else
-        this->image->data = NULL;
-    
-    const std::vector<pixdim_t> pixdimVector = mriImage.field("voxelDims");
-    const int pixdimLength = pixdimVector.size();
-    for (int i=0; i<std::min(pixdimLength,nDims); i++)
-        this->image->pixdim[i+1] = std::abs(pixdimVector[i]);
-    
-    const std::vector<std::string> pixunitsVector = mriImage.field("voxelDimUnits");
-    setPixunits(pixunitsVector);
-    
-    if (xform.rows() != 4 || xform.cols() != 4)
-        this->image->qform_code = this->image->sform_code = 0;
-    else
-    {
-        const Xform::Matrix xformMatrix(xform);
-        this->qform() = xformMatrix;
-        this->sform() = xformMatrix;
-        this->image->qform_code = this->image->sform_code = 2;
-    }
-}
 
 inline void NiftiImage::initFromList (const Rcpp::RObject &object)
 {
@@ -1075,8 +935,7 @@ inline void NiftiImage::initFromArray (const Rcpp::RObject &object, const bool c
     }
 }
 
-inline NiftiImage::NiftiImage (const SEXP object, const bool readData, const bool readOnly)
-    : image(NULL), refCount(NULL)
+inline void NiftiImage::initFromSexp (const SEXP object, const bool readData, const bool readOnly, const int depth)
 {
     Rcpp::RObject imageObject(object);
     bool resolved = false;
@@ -1126,20 +985,36 @@ inline NiftiImage::NiftiImage (const SEXP object, const bool readData, const boo
             if (this->image == NULL)
                 throw std::runtime_error("Failed to read image from path " + path);
         }
-        else if (imageObject.inherits("nifti"))
-            initFromNiftiS4(imageObject, readData);
-        else if (imageObject.inherits("anlz"))
-            throw std::runtime_error("Cannot currently convert objects of class \"anlz\"");
-        else if (imageObject.inherits("MriImage"))
-            initFromMriImage(imageObject, readData);
-        else if (Rf_isVectorList(object))
-            initFromList(imageObject);
-        else if (imageObject.hasAttribute("dim"))
-            initFromArray(imageObject, readData);
-        else if (imageObject.hasAttribute("class"))
-            throw std::runtime_error("Cannot convert object of class \"" + Rcpp::as<std::string>(imageObject.attr("class")) + "\" to a nifti_image");
         else
-            throw std::runtime_error("Cannot convert unclassed non-array object");
+        {
+            // A user-supplied asNifti() method takes priority over generic list/array duck-
+            // typing, for an object with an unrecognised class. Objects with no class, or with
+            // one of RNifti's own classes, never reach this lookup, so there's no extra cost
+            // for the common case. The depth cap bounds a badly-behaved method that might
+            // otherwise recurse indefinitely
+            bool resolvedByMethod = false;
+            if (depth < 3 && imageObject.hasAttribute("class") && !imageObject.inherits("niftiImage") && !imageObject.inherits("niftiHeader"))
+            {
+                const Rcpp::RObject converted = internal::tryCustomAsNifti(imageObject);
+                if (!Rf_isNull(converted))
+                {
+                    initFromSexp(converted, readData, readOnly, depth + 1);
+                    resolvedByMethod = true;
+                }
+            }
+            
+            if (!resolvedByMethod)
+            {
+                if (Rf_isVectorList(object))
+                    initFromList(imageObject);
+                else if (imageObject.hasAttribute("dim"))
+                    initFromArray(imageObject, readData);
+                else if (imageObject.hasAttribute("class"))
+                    throw std::runtime_error("Cannot convert object of class \"" + Rcpp::as<std::string>(imageObject.attr("class")) + "\" to a nifti_image");
+                else
+                    throw std::runtime_error("Cannot convert unclassed non-array object");
+            }
+        }
     }
     
     if (this->image != NULL)
@@ -1154,6 +1029,12 @@ inline NiftiImage::NiftiImage (const SEXP object, const bool readData, const boo
 #ifndef NDEBUG
     Rc_printf("Creating NiftiImage (v%d) with pointer %p (from SEXP)\n", RNIFTI_NIFTILIB_VERSION, (void *) this->image);
 #endif
+}
+
+inline NiftiImage::NiftiImage (const SEXP object, const bool readData, const bool readOnly)
+    : image(NULL), refCount(NULL)
+{
+    initFromSexp(object, readData, readOnly);
 }
 
 #endif // USING_R
@@ -1788,10 +1669,13 @@ inline NiftiImage & NiftiImage::replaceData (const NiftiImageData &data)
     image->scl_inter = static_cast<scale_t>(copy.intercept);
     nifti_datatype_sizes(image->datatype, &image->nbyper, &image->swapsize);
     
-    double min, max;
-    copy.minmax(&min, &max);
-    image->cal_min = static_cast<scale_t>(min);
-    image->cal_max = static_cast<scale_t>(max);
+    if (!copy.isComplex())
+    {
+        double min, max;
+        copy.minmax(&min, &max);
+        image->cal_min = static_cast<scale_t>(min);
+        image->cal_max = static_cast<scale_t>(max);
+    }
     
     copy.disown();
     
