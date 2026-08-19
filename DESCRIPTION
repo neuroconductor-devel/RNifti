@@ -11,13 +11,7 @@ Authors@R: c(person("Jon", "Clayden", role=c("cre","aut"),
         person("Jean-loup", "Gailly", role="cph"), person("Mark",
         "Adler", role="cph"))
 Imports: Rcpp (>= 0.11.0)
-Suggests: 
-    tinytest,
-    covr,
-    reportr,
-    shades,
-    jsonlite,
-    testthat
+Suggests: tinytest, covr, reportr, shades, jsonlite, testthat
 Enhances: oro.nifti, tractor.base
 LinkingTo: Rcpp
 Description: Provides very fast read and write access to images stored
@@ -32,3 +26,5 @@ URL: https://github.com/jonclayden/RNifti
 BugReports: https://github.com/jonclayden/RNifti/issues
 Encoding: UTF-8
 Config/roxygen2/version: 8.0.0
+Repository: Neuroconductor-Devel
+biocViews: 
