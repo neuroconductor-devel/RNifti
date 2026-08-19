@@ -18,3 +18,7 @@
 ^\.cache$
 ^compile_commands\.json$
 ^codecov\.yml$
+^DESCRIPTION\.bak$
+^autoci\.yml$
+^autoci_pkgdown\.yml$
+^tic\.R$
